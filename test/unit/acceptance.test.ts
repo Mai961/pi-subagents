@@ -604,6 +604,62 @@ describe("acceptance gates", () => {
 		}
 	});
 
+	it("accepts read-only reviewer reports with an empty commandsRun array as not applicable", async () => {
+		const cwd = tempGitRepo();
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "reviewer",
+				task: "Review-only. Do not edit.",
+				explicit: { level: "checked", evidence: ["review-findings", "commands-run", "validation-output", "residual-risks"] },
+			});
+			const ledger = await evaluateAcceptance({
+				acceptance,
+				output: report({
+					changedFiles: [],
+					testsAddedOrUpdated: [],
+					commandsRun: [],
+					validationOutput: ["Read-only review completed."],
+					reviewFindings: [],
+					noStagedFiles: undefined,
+				}),
+				cwd,
+			});
+
+			assert.equal(ledger.status, "checked");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:commands-run")?.status, "not-applicable");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("still rejects malformed commandsRun evidence that is not an array", async () => {
+		const cwd = tempGitRepo();
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "reviewer",
+				task: "Review-only. Do not edit.",
+				explicit: { level: "checked", evidence: ["review-findings", "commands-run", "validation-output", "residual-risks"] },
+			});
+			const ledger = await evaluateAcceptance({
+				acceptance,
+				output: report({
+					changedFiles: [],
+					testsAddedOrUpdated: [],
+					commandsRun: undefined,
+					validationOutput: ["Read-only review completed."],
+					reviewFindings: [],
+					noStagedFiles: undefined,
+				}),
+				cwd,
+			});
+
+			assert.equal(ledger.status, "rejected");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:commands-run")?.status, "failed");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("still rejects aggregate no-staged-files evidence when a child worktree reports staged files", async () => {
 		const cwd = tempGitRepo();
 		try {
@@ -738,7 +794,7 @@ describe("acceptance gates", () => {
 		}
 	});
 
-	it("still rejects missing changed and test evidence and empty required commands", async () => {
+	it("still rejects missing changed and test evidence and accepts empty commands as not applicable", async () => {
 		const cwd = tempRepo();
 		try {
 			const acceptance = resolveEffectiveAcceptance({ agentName: "worker", task: "Implement a fix", explicit: { level: "checked" } });
@@ -761,8 +817,8 @@ describe("acceptance gates", () => {
 				output: report({ changedFiles: [], testsAddedOrUpdated: [], commandsRun: [] }),
 				cwd,
 			});
-			assert.equal(emptyCommands.status, "rejected");
-			assert.match(acceptanceFailureMessage(emptyCommands) ?? "", /commands-run evidence missing/);
+			assert.equal(emptyCommands.status, "checked");
+			assert.equal(emptyCommands.runtimeChecks.find((check) => check.id === "evidence:commands-run")?.status, "not-applicable");
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
