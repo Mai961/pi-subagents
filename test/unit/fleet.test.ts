@@ -17,7 +17,7 @@ import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { spawnSync } from "node:child_process";
 import { FLEET_STATUS_WIDGET_KEY } from "../../src/tui/fleet-status.ts";
 import { setMainThinkingLevelSource } from "../../src/tui/running-tone.ts";
-import { registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
+import { asyncPromptAuditRunCount, clearAsyncPromptAudits, getAsyncPromptAuditRun, MAX_ASYNC_PROMPT_AUDIT_RUNS, registerAsyncPromptAudit, registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
 import { getArtifactPaths, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
 import type { HerdrClient } from "../../src/inspectors/herdr/client.ts";
 import { createHerdrInspectorPlugin } from "../../src/inspectors/herdr/plugin.ts";
@@ -481,10 +481,194 @@ describe("native subagent fleet", () => {
 			component.handleInput("p");
 			const rendered = component.render(100).join("\n");
 			assert.match(rendered, /Prompt Audit is available only/);
+			assert.match(rendered.replace(/[│\s]+/g, " "), /launched by another session/);
 			assert.doesNotMatch(rendered, /SECRET/);
 		} finally {
 			component.dispose();
 		}
+	});
+
+	it("opens Prompt Audit for current-session async single and parallel runs from parent memory", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-async-audit-"));
+		const single = "ASYNC_SINGLE_AUDIT_SENTINEL";
+		const first = "ASYNC_PARALLEL_FIRST_SENTINEL";
+		const second = "ASYNC_PARALLEL_SECOND_SENTINEL";
+		try {
+			writeAsyncRun(root, { id: "async-single", agents: ["worker"], startedAt: 100, lastUpdate: 300 });
+			writeAsyncRun(root, { id: "async-parallel", agents: ["scout", "reviewer"], startedAt: 150, lastUpdate: 200 });
+			const state = stateForTest();
+			registerAsyncPromptAudit(state, { runId: "async-single", index: 0, sessionId: "session-current", agent: "worker", authoredTask: single, effectivePrompt: `[Read from: notes.md]\n\n${single}\n\nACCEPTANCE_SUFFIX`, cwd: root, outputPath: path.join(root, "out.md") });
+			registerAsyncPromptAudit(state, { runId: "async-parallel", index: 0, sessionId: "session-current", agent: "scout", authoredTask: first });
+			registerAsyncPromptAudit(state, { runId: "async-parallel", index: 1, sessionId: "session-current", agent: "reviewer", authoredTask: second, effectivePrompt: second });
+			const clipboardWrites: string[] = [];
+			const redoCalls: unknown[] = [];
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 40, columns: 120 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{
+					asyncDirRoot: root,
+					refreshMs: 60_000,
+					markdownTheme,
+					copyText: (text) => { clipboardWrites.push(text); },
+					actions: {
+						async steer() { return { text: "unused" }; },
+						stop() { return { text: "unused" }; },
+						async redoPrompt(input) { redoCalls.push(input); return { text: "unused" }; },
+					},
+				},
+			);
+			try {
+				let rendered = component.render(120).join("\n");
+				assert.match(rendered, new RegExp(`Task: ${single}`));
+				assert.match(rendered, /Prompt audit: 1 recorded · 3 views · p opens/);
+				component.handleInput("p");
+				rendered = component.render(120).join("\n");
+				assert.match(rendered, /Prompt Audit/);
+				assert.match(rendered, /Source: async · background runner/);
+				assert.match(rendered, /Agent: worker/);
+				assert.match(rendered, new RegExp(single));
+				component.handleInput("2");
+				rendered = component.render(120).join("\n");
+				assert.match(rendered, /Read from: notes\.md/);
+				assert.match(rendered, /ACCEPTANCE_SUFFIX/);
+				component.handleInput("3");
+				component.handleInput("c");
+				await new Promise((resolve) => setImmediate(resolve));
+				assert.deepEqual(clipboardWrites, [`[Read from: notes.md]\n\n${single}\n\nACCEPTANCE_SUFFIX`]);
+				component.handleInput("g");
+				assert.match(component.render(120).join("\n"), /Redo is not available for async runs yet/);
+				assert.deepEqual(redoCalls, []);
+				component.handleInput("\x1b");
+				component.handleInput("j");
+				rendered = component.render(120).join("\n");
+				assert.match(rendered, new RegExp(`Task: ${first}`));
+				assert.match(rendered, /Prompt audit: 2 recorded · 3 views · p opens/);
+				component.handleInput("p");
+				rendered = component.render(120).join("\n");
+				assert.match(rendered, /Selected: 1\/2/);
+				assert.match(rendered, new RegExp(first));
+				component.handleInput("3");
+				assert.match(component.render(120).join("\n"), /assembled in the background runner/);
+				component.handleInput("j");
+				rendered = component.render(120).join("\n");
+				assert.match(rendered, /Selected: 2\/2/);
+				assert.match(rendered, /Agent: reviewer/);
+				assert.match(rendered, new RegExp(second));
+				component.handleInput("k");
+				assert.match(component.render(120).join("\n"), /Selected: 1\/2/);
+			} finally {
+				component.dispose();
+			}
+			const files: string[] = [];
+			const walk = (dir: string) => {
+				for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+					const full = path.join(dir, entry.name);
+					if (entry.isDirectory()) walk(full);
+					else files.push(full);
+				}
+			};
+			walk(root);
+			for (const file of files) assert.doesNotMatch(fs.readFileSync(file, "utf-8"), /ASYNC_(SINGLE|PARALLEL)_/);
+			assert.doesNotMatch(JSON.stringify([...state.asyncJobs.values(), ...(state.fleetJobs?.values() ?? [])]), /ASYNC_(SINGLE|PARALLEL)_/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("opens Prompt Audit from an async workflow row for its live children", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("workflow-audit", {
+			asyncId: "workflow-audit",
+			asyncDir: "/tmp/workflow-audit",
+			sessionId: "session-current",
+			status: "running",
+			mode: "workflow",
+			startedAt: 10,
+			updatedAt: 20,
+		});
+		const child = {
+			runId: "workflow-child",
+			parentWorkflowRunId: "workflow-audit",
+			workflowKey: "review",
+			workflowSteeringDir: "/tmp/workflow-audit/control/workflow-foreground/workflow-child",
+			sessionId: "session-current",
+			mode: "single" as const,
+			startedAt: 10,
+			updatedAt: 20,
+			activeChildren: new Map([[0, { index: 0, agent: "reviewer", startedAt: 10, updatedAt: 20 }]]),
+		};
+		state.foregroundControls.set(child.runId, child);
+		registerLivePromptAudit(child, 0, "WORKFLOW_CHILD_SENTINEL", "WORKFLOW_CHILD_SENTINEL");
+		registerAsyncPromptAudit(state, { runId: "workflow-async-child", index: 0, sessionId: "session-current", agent: "writer", authoredTask: "WORKFLOW_ASYNC_CHILD", effectivePrompt: "WORKFLOW_ASYNC_CHILD", parentWorkflowRunId: "workflow-audit" });
+		assert.deepEqual(collectFleetSnapshot(state).items.map((item) => item.key), ["async:workflow-audit"]);
+		const component = new SubagentFleetComponent(
+			{ terminal: { rows: 32, columns: 110 }, requestRender() {} } as never,
+			theme as never,
+			state,
+			() => {},
+			{ refreshMs: 60_000, markdownTheme },
+		);
+		try {
+			assert.match(component.render(110).join("\n"), /Prompt audit: 2 live · 3 views · p opens/);
+			component.handleInput("p");
+			let rendered = component.render(110).join("\n");
+			assert.match(rendered, /Agent: review \(reviewer\)/);
+			assert.match(rendered, /WORKFLOW_CHILD_SENTINEL/);
+			component.handleInput("j");
+			rendered = component.render(110).join("\n");
+			assert.match(rendered, /Selected: 2\/2/);
+			assert.match(rendered, /WORKFLOW_ASYNC_CHILD/);
+		} finally {
+			component.dispose();
+		}
+	});
+
+	it("explains why Prompt Audit is unavailable for an async row without a recorded prompt", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-async-audit-missing-"));
+		try {
+			writeAsyncRun(root, { id: "async-before-session", agents: ["worker"] });
+			const state = stateForTest();
+			registerAsyncPromptAudit(state, { runId: "async-before-session", index: 0, sessionId: "session-other", authoredTask: "OTHER_SESSION_SECRET", effectivePrompt: "OTHER_SESSION_SECRET" });
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{ asyncDirRoot: root, refreshMs: 60_000, markdownTheme },
+			);
+			try {
+				assert.doesNotMatch(component.render(100).join("\n"), /Prompt audit:|OTHER_SESSION_SECRET/);
+				component.handleInput("p");
+				const rendered = component.render(100).join("\n");
+				const flattened = rendered.replace(/[│\s]+/g, " ");
+				assert.match(flattened, /Prompt Audit is available only for async runs launched by this session/);
+				assert.match(flattened, /started before this session was loaded/);
+				assert.doesNotMatch(rendered, /OTHER_SESSION_SECRET/);
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("scopes async prompt records to the launching session and caps retained runs", () => {
+		const state = stateForTest();
+		registerAsyncPromptAudit(state, { runId: "scoped", index: 0, sessionId: "session-current", authoredTask: "A", effectivePrompt: "A" });
+		assert.ok(getAsyncPromptAuditRun(state, "scoped", "session-current"));
+		assert.equal(getAsyncPromptAuditRun(state, "scoped", "session-other"), undefined);
+		assert.equal(getAsyncPromptAuditRun(state, "scoped", null), undefined);
+		assert.equal(getAsyncPromptAuditRun(stateForTest(), "scoped", "session-current"), undefined, "records are scoped to the owning state");
+		for (let index = 0; index < MAX_ASYNC_PROMPT_AUDIT_RUNS + 5; index++) {
+			registerAsyncPromptAudit(state, { runId: `cap-${index}`, index: 0, sessionId: "session-current", authoredTask: "T" });
+		}
+		assert.equal(asyncPromptAuditRunCount(state), MAX_ASYNC_PROMPT_AUDIT_RUNS);
+		assert.equal(getAsyncPromptAuditRun(state, "scoped", "session-current"), undefined, "oldest runs are evicted first");
+		assert.ok(getAsyncPromptAuditRun(state, `cap-${MAX_ASYNC_PROMPT_AUDIT_RUNS + 4}`, "session-current"));
+		clearAsyncPromptAudits(state);
+		assert.equal(asyncPromptAuditRunCount(state), 0);
 	});
 
 	it("keeps tracked missing-start rows stable across opposing heartbeat updates", () => {

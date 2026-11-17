@@ -18,6 +18,10 @@ import { registerRequiredChildExtensions } from "../../src/api/required-child-ex
 import { deriveForkPromptCacheKey } from "../../src/runs/shared/child-tool-plan.ts";
 import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, STRUCTURED_OUTPUT_FOLLOW_UP, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
 import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
+import { SUBAGENT_ASYNC_STARTED_EVENT, TEMP_ARTIFACTS_DIR } from "../../src/shared/types.ts";
+import { SubagentFleetComponent } from "../../src/tui/fleet.ts";
+import { createAsyncJobTracker } from "../../src/runs/background/async-job-tracker.ts";
+import { getAsyncPromptAuditRun, getLivePromptAudit } from "../../src/runs/foreground/prompt-audit.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload } from "../support/async-execution-fixture.ts";
 import {
 	installAsyncExecutionHooks, waitForMockPiRuntime, available, isAsyncAvailable,
@@ -1307,6 +1311,153 @@ export default function() {
 		assert.equal(payload.results[0]?.model, "deepseek/deepseek-v4-flash");
 		const args = readMockPiArgs(mockPi, 0);
 		assert.equal(args[args.indexOf("--model") + 1], "deepseek/deepseek-v4-flash");
+	});
+
+	it("records async single and async workflow fan-out prompts for Fleet Prompt Audit without writing them to disk", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const singleSentinel = "ASYNC_AUDIT_SINGLE_SENTINEL_7311";
+		const firstSentinel = "ASYNC_AUDIT_FANOUT_FIRST_7311";
+		const secondSentinel = "ASYNC_AUDIT_FANOUT_SECOND_7311";
+		mockPi.onCall({ matchArgIncludes: singleSentinel, output: "single done" });
+		mockPi.onCall({ matchArgIncludes: firstSentinel, delay: 1_500, output: "first done" });
+		mockPi.onCall({ matchArgIncludes: secondSentinel, delay: 1_500, output: "second done" });
+		const state = {
+			baseCwd: tempDir,
+			currentSessionId: "session-123",
+			asyncJobs: new Map(),
+			fleetJobs: new Map(),
+			foregroundControls: new Map(),
+			foregroundRuns: new Map(),
+			lastForegroundControlId: null,
+			workflowControllers: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+		const events = createEventBus();
+		// Wire the real async job tracker like the extension does, so Fleet sees tracked async rows.
+		const tracker = createAsyncJobTracker({ events } as never, state as never, ASYNC_DIR, { platform: "linux", completionRetentionMs: 60_000 });
+		events.on(SUBAGENT_ASYNC_STARTED_EVENT, (payload) => tracker.handleStarted(payload));
+		const executor = createSubagentExecutor!({
+			pi: { events, getSessionName: () => undefined, sendMessage() {} },
+			state,
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => path.join(tempDir, "sessions"),
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [makeAgent("worker")] }),
+		});
+		try {
+			const renderFleet = (initialKey: string, keys: string[]): string[] => {
+				const component = new SubagentFleetComponent(
+					{ terminal: { rows: 40, columns: 140 }, requestRender() {} } as never,
+					{ fg: (_name: string, text: string) => text, bold: (text: string) => text } as never,
+					state as never,
+					() => {},
+					{ asyncDirRoot: ASYNC_DIR, initialKey, refreshMs: 60_000, markdownTheme: new Proxy({}, { get: () => (text: string) => text }) as never },
+				);
+				try {
+					// Keep only the detail column so roster rows from other runs cannot interleave with it.
+					const detail = () => component.render(140).map((line) => line.split("│")).filter((parts) => parts.length >= 4).map((parts) => parts[2]!.trim()).join(" ").replace(/\s+/g, " ");
+					const frames = [detail()];
+					for (const key of keys) {
+						component.handleInput(key);
+						frames.push(detail());
+					}
+					return frames;
+				} finally {
+					component.dispose();
+				}
+			};
+
+			const single = await executor.execute(
+				"async-audit-single",
+				{ agent: "worker", task: singleSentinel, async: true, output: "audit-out.md" },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			) as AsyncExecutionResult;
+			assert.equal(single.isError, undefined, single.content.map((item) => item.text).join("\n"));
+			const singleId = single.details.asyncId!;
+			const singleAudit = getAsyncPromptAuditRun(state as never, singleId, "session-123")?.prompts.get(0);
+			assert.ok(singleAudit, "async single launch should record a parent-memory prompt audit");
+			assert.equal(singleAudit.authoredTask, singleSentinel);
+			const singleFrames = renderFleet(`async:${singleId}:0`, ["p", "2", "3"]);
+			console.log(`[real-use] async single ${singleId} detail: ${singleFrames[0]!.match(/Task: \S+ .*?Prompt audit: [^·]+· 3 views · p opens/)?.[0]}`);
+			assert.match(singleFrames[0]!, new RegExp(`Task: ${singleSentinel}`));
+			assert.match(singleFrames[0]!, /Prompt audit: 1 recorded · 3 views · p opens/);
+			assert.match(singleFrames[1]!, /Prompt Audit Retention: live memory only · no storage/);
+			assert.match(singleFrames[1]!, new RegExp(singleSentinel));
+			assert.match(singleFrames[2]!, /\[2\] Runtime additions --- \*\*Output:\*\* Write your findings to exactly this path/);
+			assert.match(singleFrames[2]!, /Acceptance Contract/);
+			assert.match(singleFrames[3]!, new RegExp(`\\[3\\] Final effective prompt ${singleSentinel}`));
+			const singlePayload = await readAsyncPayload(singleId);
+			assert.equal(singlePayload.success, true);
+			// The runner prompts `Task: <task>` and carries the acceptance contract in the system prompt;
+			// the audited effective prompt is `<task>\n<acceptance contract>`, as for foreground Prompt Audit.
+			const sentArgs = readMockPiArgsMatching(mockPi, singleSentinel);
+			const sentTask = sentArgs.at(-1)!.replace(/^Task: /, "");
+			const sentSystemPrompt = sentArgs[sentArgs.indexOf("--system-prompt") + 1] ?? sentArgs[sentArgs.indexOf("--append-system-prompt") + 1] ?? "";
+			const auditedAcceptance = singleAudit.finalEffectivePrompt.slice(sentTask.length + 1);
+			const effectiveMatchesRunner = singleAudit.finalEffectivePrompt.startsWith(`${sentTask}\n`) && auditedAcceptance.includes("Acceptance Contract") && sentSystemPrompt.includes(auditedAcceptance);
+			assert.ok(effectiveMatchesRunner, "audited effective prompt should equal the task and acceptance contract the background runner sent");
+			console.log(`[real-use] async single effective prompt matches runner argv (task arg + system-prompt acceptance): ${effectiveMatchesRunner} (${singleAudit.finalEffectivePrompt.length} chars)`);
+			assert.match(renderFleet(`async:${singleId}:0`, ["p"])[1]!, new RegExp(singleSentinel), "recently finished async runs stay auditable while the parent session lives");
+
+			const workflow = await executor.execute(
+				"async-audit-workflow",
+				{
+					workflowScript: `return runs.all([{ key: "first", agent: "worker", task: "${firstSentinel}" }, { key: "second", agent: "worker", task: "${secondSentinel}" }]);`,
+					async: true,
+				},
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			) as AsyncExecutionResult;
+			assert.equal(workflow.isError, undefined);
+			const workflowId = workflow.details.asyncId!;
+			const liveChildren = () => [...state.foregroundControls.values()]
+				.filter((control: { parentWorkflowRunId?: string }) => control.parentWorkflowRunId === workflowId)
+				.filter((control) => getLivePromptAudit(control as never, 0));
+			for (let attempt = 0; attempt < 200 && liveChildren().length < 2; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+			assert.equal(liveChildren().length, 2, "both workflow fan-out children should be live with prompt audits");
+			const workflowFrames = renderFleet(`async:${workflowId}`, ["p", "j"]);
+			console.log(`[real-use] async workflow ${workflowId} detail: ${workflowFrames[0]!.match(/Prompt audit: [^·]+· 3 views · p opens/)?.[0]}; panel: ${workflowFrames[1]!.match(/Selected: \d\/\d/)?.[0]} -> ${workflowFrames[2]!.match(/Selected: \d\/\d/)?.[0]}`);
+			assert.match(workflowFrames[0]!, /Prompt audit: 2 live · 3 views · p opens/);
+			assert.match(workflowFrames[1]!, /Selected: 1\/2/);
+			assert.match(workflowFrames[1]!, new RegExp(firstSentinel));
+			assert.match(workflowFrames[2]!, /Selected: 2\/2/);
+			assert.match(workflowFrames[2]!, new RegExp(secondSentinel));
+			const workflowPayload = await readAsyncPayload(workflowId);
+			assert.equal(workflowPayload.success, true);
+
+			const leaked: string[] = [];
+			const scanned: string[] = [];
+			const scan = (target: string) => {
+				if (!fs.existsSync(target)) return;
+				const stat = fs.statSync(target);
+				if (stat.isDirectory()) {
+					for (const entry of fs.readdirSync(target)) scan(path.join(target, entry));
+					return;
+				}
+				scanned.push(target);
+				// Child session names ("<agent>: <task excerpt>") are display metadata persisted by the base
+				// runtime independently of Prompt Audit; everything else must stay prompt-free.
+				const text = fs.readFileSync(target, "utf-8").replace(/(\\?"sessionName\\?":\s*\\?")worker: [^"\\]*/g, "$1");
+				if (/ASYNC_AUDIT_(SINGLE|FANOUT)_/.test(text)) leaked.push(target);
+			};
+			for (const target of [tempDir, TEMP_ARTIFACTS_DIR, path.join(ASYNC_DIR, singleId), path.join(ASYNC_DIR, workflowId), path.join(RESULTS_DIR, `${singleId}.json`), path.join(RESULTS_DIR, `${workflowId}.json`)]) scan(target);
+			const runFiles = scanned.filter((file) => file.includes(singleId) || file.includes(workflowId));
+			console.log(`[real-use] scanned ${scanned.length} files (${runFiles.length} under this test's run ids, e.g. ${runFiles.map((file) => path.basename(file)).slice(0, 8).join(", ")}) for prompt sentinels; leaked files: ${leaked.length ? leaked.join(", ") : "none"}`);
+			assert.ok(runFiles.length > 0, "the scan must cover files the runs actually wrote");
+			assert.deepEqual(leaked, []);
+		} finally {
+			tracker.resetJobs();
+		}
 	});
 
 	it("async workflows snapshot the parent model before workflow setup reads session data", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

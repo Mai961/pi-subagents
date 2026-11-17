@@ -35,6 +35,7 @@ import { withCachedUiContext } from "../../shared/extension-context.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 import { ownerSessionIds } from "../shared/run-ownership.ts";
+import { clearAsyncPromptAudits, removeAsyncPromptAudit } from "../foreground/prompt-audit.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -80,7 +81,10 @@ function rememberFleetJob(state: SubagentState, job: AsyncJobState): void {
 	const terminal = [...state.fleetJobs.values()]
 		.filter((candidate) => isTerminalJobStatus(candidate.status))
 		.sort((left, right) => (right.updatedAt ?? right.startedAt ?? 0) - (left.updatedAt ?? left.startedAt ?? 0));
-	for (const stale of terminal.slice(MAX_RECENT_FLEET_JOBS)) state.fleetJobs.delete(stale.asyncId);
+	for (const stale of terminal.slice(MAX_RECENT_FLEET_JOBS)) {
+		state.fleetJobs.delete(stale.asyncId);
+		removeAsyncPromptAudit(state, stale.asyncId);
+	}
 }
 
 export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: SubagentState, asyncDirRoot: string, options: AsyncJobTrackerOptions = {}): {
@@ -859,6 +863,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		state.cleanupTimers.clear();
 		state.asyncJobs.clear();
 		state.fleetJobs?.clear();
+		clearAsyncPromptAudits(state);
 		state.foregroundControls?.clear();
 		state.liveAsyncSessionRoots?.clear();
 		state.lastForegroundControlId = null;

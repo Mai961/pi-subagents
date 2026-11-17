@@ -8,6 +8,7 @@ import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
 import { resultFilePath } from "../background/result-files.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
+import { removeAsyncPromptAudit } from "./prompt-audit.ts";
 
 export function dismissRecoveredWorkflow(
 	state: SubagentState,
@@ -80,6 +81,8 @@ export function dismissRecoveredWorkflow(
 	state.asyncJobs.delete(runId);
 	state.fleetJobs?.delete(status.runId);
 	state.fleetJobs?.delete(runId);
+	removeAsyncPromptAudit(state, status.runId);
+	removeAsyncPromptAudit(state, runId);
 	return {
 		content: [{ type: "text", text: `Dismissed recovered workflow ${status.runId} from the display. No running work was terminated.` }],
 		details: { mode: "management", results: [] },

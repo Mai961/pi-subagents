@@ -7,6 +7,7 @@ import { getArtifactsDir } from "../../src/shared/artifacts.ts";
 import { SUBAGENT_CHILD_STATUS_EVENT, SUBAGENT_CONTROL_EVENT, SUBAGENT_CONTROL_INTERCOM_EVENT, type ControlEvent } from "../../src/shared/types.ts";
 import { ACTIVE_RUN_INDEX_DIR, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR } from "../../src/runs/shared/external-job-bridge.ts";
+import { asyncPromptAuditRunCount, getAsyncPromptAuditRun, registerAsyncPromptAudit } from "../../src/runs/foreground/prompt-audit.ts";
 import { createNativeSupervisorChannel, ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 import { SubagentFleetComponent } from "../../src/tui/fleet.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
@@ -475,6 +476,31 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		} finally {
 			removeTempDir(asyncRoot);
 			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("drops async Prompt Audit records when fleet history prunes a run or the session resets", () => {
+		const asyncRoot = createTempDir("pi-async-job-audit-prune-");
+		try {
+			const state = createState();
+			const recorder = createEventRecorder();
+			const tracker = createTracker(recorder.pi, state as never, asyncRoot, { completionRetentionMs: 60_000 });
+			tracker.resetJobs();
+			const ids = Array.from({ length: 22 }, (_, index) => `audit-run-${index}`);
+			for (const id of ids) {
+				tracker.handleStarted({ id, asyncDir: path.join(asyncRoot, id), agent: "worker", sessionId: "session-current" });
+				registerAsyncPromptAudit(state as never, { runId: id, index: 0, sessionId: "session-current", authoredTask: `task ${id}`, effectivePrompt: `task ${id}` });
+			}
+			for (const id of ids) tracker.handleComplete({ id, success: true });
+			assert.ok(state.fleetJobs.size < ids.length, "fleet history should prune old terminal runs");
+			for (const id of ids) {
+				assert.equal(Boolean(getAsyncPromptAuditRun(state as never, id, "session-current")), state.fleetJobs.has(id), `audit retention for ${id} should follow fleet history`);
+			}
+			assert.equal(asyncPromptAuditRunCount(state as never), state.fleetJobs.size);
+			tracker.resetJobs();
+			assert.equal(asyncPromptAuditRunCount(state as never), 0, "session reset should clear async prompt audits");
+		} finally {
+			removeTempDir(asyncRoot);
 		}
 	});
 

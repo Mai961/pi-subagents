@@ -29,6 +29,7 @@ import { createSubagentParamsSchema } from "./schemas.ts";
 import { resolveDisabledFeatureSurface } from "../shared/disabled-features.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
+import { clearAsyncPromptAudits } from "../runs/foreground/prompt-audit.ts";
 import { getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
 import { cleanupResultIndexes, missionObserverResultCandidateFiles, resultFilePath } from "../runs/background/result-files.ts";
 import { ASYNC_RETENTION_DELAY_MS, cleanupAsyncRetention } from "../runs/background/async-retention.ts";
@@ -1106,6 +1107,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
 			state.cleanupTimers.clear();
 			state.asyncJobs.clear();
+			clearAsyncPromptAudits(state);
 			retainedNestedRouteTracker?.clear();
 			retainedNestedRouteTracker = undefined;
 			executorDeps.trackRetainedNestedRoute = undefined;

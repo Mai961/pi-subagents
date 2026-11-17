@@ -3,7 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ProviderHeaders } from "@earendil-works/pi-ai";
 import { agentStreamOptions } from "../../shared/agent-stream-options.ts";
 import { opencodeSessionHeaders } from "../../shared/opencode-session-headers.ts";
-import type { ForegroundRunControl } from "../../shared/types.ts";
+import type { ForegroundRunControl, SubagentState } from "../../shared/types.ts";
 export type PromptAuditView = "authored" | "runtime" | "effective";
 
 export interface PromptAuditRerunContract {
@@ -170,4 +170,92 @@ export function removeLivePromptAudit(control: ForegroundRunControl, index: numb
 	if (!prompts) return;
 	prompts.delete(index);
 	if (prompts.size === 0) livePrompts.delete(control);
+}
+
+/**
+ * Async Prompt Audit store. Prompts stay in parent-process memory only, scoped to the
+ * SubagentState that launched the run and to the launching session id. Nothing here is
+ * ever written to disk; the detached runner and status files keep PROMPT_REDACTED.
+ */
+export const MAX_ASYNC_PROMPT_AUDIT_RUNS = 200;
+
+export const ASYNC_EFFECTIVE_PROMPT_UNAVAILABLE = "(Final effective prompt is assembled in the background runner and is not available to Prompt Audit.)";
+
+export interface AsyncPromptAuditRecord {
+	sessionId: string;
+	parentWorkflowRunId?: string;
+	prompts: Map<number, LivePromptAudit & { agent?: string }>;
+}
+
+const asyncPrompts = new WeakMap<SubagentState, Map<string, AsyncPromptAuditRecord>>();
+
+export function registerAsyncPromptAudit(state: SubagentState, input: {
+	runId: string;
+	index: number;
+	sessionId: string;
+	agent?: string;
+	authoredTask: string;
+	/** Omit when the final prompt is only assembled inside the background runner. */
+	effectivePrompt?: string;
+	cwd?: string;
+	outputPath?: string;
+	parentWorkflowRunId?: string;
+}): void {
+	let runs = asyncPrompts.get(state);
+	if (!runs) {
+		runs = new Map();
+		asyncPrompts.set(state, runs);
+	}
+	let record = runs.get(input.runId);
+	if (!record || record.sessionId !== input.sessionId) {
+		record = {
+			sessionId: input.sessionId,
+			...(input.parentWorkflowRunId ? { parentWorkflowRunId: input.parentWorkflowRunId } : {}),
+			prompts: new Map(),
+		};
+	}
+	// Re-insert to keep Map iteration order as least-recently-registered first.
+	runs.delete(input.runId);
+	runs.set(input.runId, record);
+	record.prompts.set(input.index, {
+		authoredTask: input.authoredTask,
+		runtimeAdditions: input.effectivePrompt === undefined ? ASYNC_EFFECTIVE_PROMPT_UNAVAILABLE : runtimeAdditions(input.authoredTask, input.effectivePrompt),
+		finalEffectivePrompt: input.effectivePrompt ?? ASYNC_EFFECTIVE_PROMPT_UNAVAILABLE,
+		...(input.agent ? { agent: input.agent } : {}),
+		...(input.cwd ? { cwd: input.cwd } : {}),
+		...(input.outputPath ? { outputPath: input.outputPath } : {}),
+	});
+	while (runs.size > MAX_ASYNC_PROMPT_AUDIT_RUNS) {
+		const oldest = runs.keys().next().value;
+		if (oldest === undefined) break;
+		runs.delete(oldest);
+	}
+}
+
+/** Returns the recorded run only when it was launched by `sessionId`. */
+export function getAsyncPromptAuditRun(state: SubagentState, runId: string, sessionId: string | null | undefined): AsyncPromptAuditRecord | undefined {
+	if (!sessionId) return undefined;
+	const record = asyncPrompts.get(state)?.get(runId);
+	return record?.sessionId === sessionId ? record : undefined;
+}
+
+export function asyncPromptAuditOwner(state: SubagentState, runId: string): string | undefined {
+	return asyncPrompts.get(state)?.get(runId)?.sessionId;
+}
+
+export function listAsyncPromptAuditRuns(state: SubagentState, sessionId: string | null | undefined): Array<[string, AsyncPromptAuditRecord]> {
+	if (!sessionId) return [];
+	return [...(asyncPrompts.get(state)?.entries() ?? [])].filter(([, record]) => record.sessionId === sessionId);
+}
+
+export function removeAsyncPromptAudit(state: SubagentState, runId: string): void {
+	asyncPrompts.get(state)?.delete(runId);
+}
+
+export function clearAsyncPromptAudits(state: SubagentState): void {
+	asyncPrompts.delete(state);
+}
+
+export function asyncPromptAuditRunCount(state: SubagentState): number {
+	return asyncPrompts.get(state)?.size ?? 0;
 }
