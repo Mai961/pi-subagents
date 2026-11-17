@@ -25,6 +25,13 @@ Choose per job, and mix them when that fits. Either way, raw material you only n
 
 Do not launch a child before you know what you are asking it. Size a job by the question, not by the volume of material: an audit is one child with a sampling plan unless full coverage is asked for.
 
+## Leave a trace
+
+These choices are audited later, so record them where the transcript keeps them. One line each:
+
+- Before you start a job, write `Approach: <top-down | bottom-up | on my own>, because <reason>.`
+- Begin every brief with `Why: <model>:<level>, because <reason>.`
+
 ## Roles
 
 Roles are defined by what a child may do, not by the job. The job is whatever you write in the brief.
