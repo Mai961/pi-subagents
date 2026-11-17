@@ -16,7 +16,7 @@ import {
 	settleForegroundSchedulingOwner,
 	updateForegroundChild,
 } from "./foreground-control.ts";
-import { getLivePromptAudit, rewritePromptWithGuidance, updateLiveEffectivePrompt } from "./prompt-audit.ts";
+import { getLivePromptAudit, registerAsyncPromptAudit, rewritePromptWithGuidance, updateLiveEffectivePrompt } from "./prompt-audit.ts";
 import { discardRunningForegroundRun, persistForegroundRun, MAX_REMEMBERED_FOREGROUND_RUNS } from "./foreground-history.ts";
 import { projectScopeRequiresTrustMessage, resolveExecutionAgentScope } from "../../agents/agent-scope.ts";
 import { handleManagementAction } from "../../agents/agent-management.ts";
@@ -3702,11 +3702,26 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		const modelOverrideFromParent = modelOrigin === "inherited";
 		const launchRuleError = applyWatchdogLaunchRules({ cwd: effectiveCwd, agent: a.name, model: modelOverride ?? (parentModel && `${parentModel.provider}/${parentModel.id}`), warn: (violation) => deps.watchdog?.displayRuleWarning(violation) });
 		if (launchRuleError) return toExecutionErrorResult(params, new Error(launchRuleError), data.contextPolicy.contextSummary);
+		const promptAuditSessionId = data.parentSessionId;
 		const asyncResult = await executeAsyncSingle(id, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
 			toolCallId: data.toolCallId,
 			agent: params.agent!,
 			task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
 			goal: params.task ?? "",
+			// Parent-memory Prompt Audit for this session's Fleet; never persisted.
+			onEffectivePrompt: promptAuditSessionId
+				? (audit) => registerAsyncPromptAudit(deps.state, compactOptional<Parameters<typeof registerAsyncPromptAudit>[1]>({
+					runId: id,
+					index: 0,
+					sessionId: promptAuditSessionId,
+					agent: params.agent!,
+					authoredTask: params.task ?? "",
+					effectivePrompt: audit.effectivePrompt,
+					cwd: audit.cwd,
+					outputPath: audit.outputPath,
+					parentWorkflowRunId: params.workflowParentRunId,
+				}))
+				: undefined,
 			agentConfig: a,
 			recoveryAgentConfig: data.recoveryAgents.find((agent) => agent.name === params.agent),
 			requiredExtensions: data.requiredExtensions,

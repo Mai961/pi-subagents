@@ -28,7 +28,7 @@ import { runningTone } from "./running-tone.ts";
 import { childThinkingLevel, type ThinkingLevel } from "../shared/model-info.ts";
 import { handleInspectorAction } from "../inspectors/actions.ts";
 import type { InspectorPlugin } from "../inspectors/types.ts";
-import { getLivePromptAudit, type LivePromptAudit, type PromptAuditView } from "../runs/foreground/prompt-audit.ts";
+import { asyncPromptAuditOwner, getAsyncPromptAuditRun, getLivePromptAudit, listAsyncPromptAuditRuns, type LivePromptAudit, type PromptAuditView } from "../runs/foreground/prompt-audit.ts";
 
 const REFRESH_MS = 750;
 const MIN_REFRESH_MS = 250;
@@ -380,10 +380,149 @@ function statusGlyph(item: FleetItem, theme: Theme): string {
 	return theme.fg("error", "✗");
 }
 
-function foregroundPromptAuditCount(item: Extract<FleetItem, { kind: "foreground-active" }>, state: SubagentState): number {
-	if (!state.currentSessionId || item.control.sessionId !== state.currentSessionId) return 0;
-	if (!item.control.activeChildren) return getLivePromptAudit(item.control, item.index ?? 0) ? 1 : 0;
-	return [...item.control.activeChildren.keys()].filter((index) => getLivePromptAudit(item.control, index)).length;
+type PromptAuditScope =
+	| { kind: "foreground"; control: ForegroundRunControl }
+	| { kind: "async"; runId: string }
+	| { kind: "workflow"; runId: string };
+
+interface PromptAuditEntry {
+	key: string;
+	source: "foreground" | "async";
+	runId: string;
+	index: number;
+	agent: string;
+	prompt: LivePromptAudit;
+	fleetKey: string;
+	control?: ForegroundRunControl;
+	startedAt?: number;
+	model?: string;
+	thinking?: string;
+}
+
+const PROMPT_AUDIT_REFUSAL_PREFIX = "Prompt Audit is available only for";
+
+function ownsForegroundControl(control: ForegroundRunControl, state: SubagentState): boolean {
+	return Boolean(state.currentSessionId) && control.sessionId === state.currentSessionId;
+}
+
+function foregroundPromptAuditEntries(control: ForegroundRunControl, state: SubagentState, labelPrefix?: string): PromptAuditEntry[] {
+	if (!ownsForegroundControl(control, state)) return [];
+	const label = (agent: string) => labelPrefix ? `${labelPrefix} (${agent})` : agent;
+	if (!control.activeChildren) {
+		const index = control.currentIndex ?? 0;
+		const prompt = getLivePromptAudit(control, index);
+		return prompt ? [{
+			key: `foreground:${control.runId}:${index}`,
+			source: "foreground",
+			runId: control.runId,
+			index,
+			agent: label(control.currentAgent ?? control.mode),
+			prompt,
+			fleetKey: `foreground-active:${control.runId}:${index}`,
+			control,
+			startedAt: control.startedAt,
+			...(control.model ? { model: control.model } : {}),
+			...(control.thinking ? { thinking: control.thinking } : {}),
+		}] : [];
+	}
+	return [...control.activeChildren.values()].sort((left, right) => left.index - right.index).flatMap((child) => {
+		const prompt = getLivePromptAudit(control, child.index);
+		return prompt ? [{
+			key: `foreground:${control.runId}:${child.index}`,
+			source: "foreground" as const,
+			runId: control.runId,
+			index: child.index,
+			agent: label(child.agent),
+			prompt,
+			fleetKey: `foreground-active:${control.runId}:${child.index}`,
+			control,
+			startedAt: child.startedAt,
+			...(child.model ? { model: child.model } : {}),
+			...(child.thinking ? { thinking: child.thinking } : {}),
+		}] : [];
+	});
+}
+
+function asyncPromptAuditEntries(runId: string, state: SubagentState, run?: AsyncRunSummary): PromptAuditEntry[] {
+	if (run?.sessionId && run.sessionId !== state.currentSessionId) return [];
+	const record = getAsyncPromptAuditRun(state, runId, state.currentSessionId);
+	if (!record) return [];
+	return [...record.prompts.entries()].sort(([left], [right]) => left - right).map(([index, prompt]) => {
+		const step = run?.steps.find((candidate) => candidate.index === index);
+		const perStepRows = run !== undefined && run.steps.length > 0 && run.mode !== "workflow";
+		return {
+			key: `async:${runId}:${index}`,
+			source: "async" as const,
+			runId,
+			index,
+			agent: step ? (step.label ? `${step.label} (${step.agent})` : step.agent) : prompt.agent ?? "subagent",
+			prompt,
+			fleetKey: perStepRows ? `async:${runId}:${index}` : `async:${runId}`,
+			...(run ? { startedAt: run.startedAt } : {}),
+			...(step?.model ? { model: step.model } : {}),
+			...(step?.thinking ? { thinking: step.thinking } : {}),
+		};
+	});
+}
+
+function promptAuditScopeForItem(item: FleetItem | undefined): PromptAuditScope | undefined {
+	if (item?.kind === "foreground-active") return { kind: "foreground", control: item.control };
+	if (item?.kind === "async") return item.run.mode === "workflow" && item.index === undefined ? { kind: "workflow", runId: item.runId } : { kind: "async", runId: item.runId };
+	return undefined;
+}
+
+function promptAuditEntriesForScope(scope: PromptAuditScope | undefined, state: SubagentState, items: FleetItem[] = []): PromptAuditEntry[] {
+	if (!scope || !state.currentSessionId) return [];
+	const runFor = (runId: string) => items.find((item): item is Extract<FleetItem, { kind: "async" }> => item.kind === "async" && item.runId === runId)?.run;
+	if (scope.kind === "foreground") return foregroundPromptAuditEntries(scope.control, state);
+	if (scope.kind === "async") return asyncPromptAuditEntries(scope.runId, state, runFor(scope.runId));
+	const workflowRun = runFor(scope.runId);
+	if (workflowRun?.sessionId && workflowRun.sessionId !== state.currentSessionId) return [];
+	const foreground = [...state.foregroundControls.values()]
+		.filter((control) => control.parentWorkflowRunId === scope.runId)
+		.sort((left, right) => left.startedAt - right.startedAt)
+		.flatMap((control) => foregroundPromptAuditEntries(control, state, control.workflowKey));
+	const background = listAsyncPromptAuditRuns(state, state.currentSessionId)
+		.filter(([, record]) => record.parentWorkflowRunId === scope.runId)
+		.flatMap(([runId]) => asyncPromptAuditEntries(runId, state, runFor(runId)));
+	return [...foreground, ...background];
+}
+
+function promptAuditEntryForItem(item: FleetItem, entries: PromptAuditEntry[]): PromptAuditEntry | undefined {
+	const exact = entries.find((entry) => entry.fleetKey === item.key);
+	// A foreground child row is one child: never open a sibling's prompt for a row without its own record.
+	// Run-level async and workflow rows stand for their children, so they open the first one.
+	if (exact || item.kind === "foreground-active") return exact;
+	return entries[0];
+}
+
+function promptAuditDetailLine(item: FleetItem, count: number): string | undefined {
+	if (count === 0) return undefined;
+	const freshness = item.kind === "async" && item.run.mode !== "workflow" ? "recorded" : "live";
+	return `Prompt audit: ${count} ${freshness} · 3 views · p opens`;
+}
+
+function rowPromptSummary(item: FleetItem, state: SubagentState): string | undefined {
+	const scope = promptAuditScopeForItem(item);
+	if (!scope || scope.kind === "workflow") return undefined;
+	const entry = promptAuditEntriesForScope(scope, state, [item]).find((candidate) => candidate.fleetKey === item.key);
+	return entry ? authoredPromptSummary(entry.prompt.authoredTask) : undefined;
+}
+
+function promptAuditUnavailableReason(item: FleetItem | undefined, state: SubagentState): string {
+	if (!item) return "No child is selected.";
+	if (item.kind === "external") return `${PROMPT_AUDIT_REFUSAL_PREFIX} subagent runs; external jobs are display-only and owned by another extension.`;
+	if (item.kind === "foreground-recent") return `${PROMPT_AUDIT_REFUSAL_PREFIX} live or background children launched by this session; this foreground child has finished and prompts are never stored.`;
+	if (!state.currentSessionId) return `${PROMPT_AUDIT_REFUSAL_PREFIX} children launched by this session; no current session is active.`;
+	if (item.kind === "foreground-active") {
+		return item.control.sessionId !== state.currentSessionId
+			? `${PROMPT_AUDIT_REFUSAL_PREFIX} children launched by this session; this run was launched by another session.`
+			: `${PROMPT_AUDIT_REFUSAL_PREFIX} children with a recorded prompt; this live child has no prompt record.`;
+	}
+	const owner = item.run.sessionId ?? asyncPromptAuditOwner(state, item.runId);
+	if (owner && owner !== state.currentSessionId) return `${PROMPT_AUDIT_REFUSAL_PREFIX} children launched by this session; this async run was launched by another session.`;
+	if (item.run.mode === "workflow") return `${PROMPT_AUDIT_REFUSAL_PREFIX} workflow children with a recorded prompt; no child of this workflow is live with a prompt record right now.`;
+	return `${PROMPT_AUDIT_REFUSAL_PREFIX} async runs launched by this session in this Pi process; this run started before this session was loaded (or before a reload), was a resume/revival, or its in-memory record was pruned, and prompts are never stored on disk.`;
 }
 
 function promptAuditString(value: unknown): string | undefined {
@@ -394,12 +533,6 @@ function authoredPromptSummary(text: unknown): string | undefined {
 	if (typeof text !== "string") return undefined;
 	const summary = text.replace(/\s+/g, " ").trim();
 	return summary ? truncateToWidth(summary, PROMPT_AUDIT_SUMMARY_WIDTH, "…") : undefined;
-}
-
-function foregroundAuthoredPromptSummary(item: Extract<FleetItem, { kind: "foreground-active" }>, state: SubagentState): string | undefined {
-	if (!state.currentSessionId || item.control.sessionId !== state.currentSessionId) return undefined;
-	const prompt = getLivePromptAudit(item.control, item.index ?? 0);
-	return prompt ? authoredPromptSummary(prompt.authoredTask) : undefined;
 }
 
 function promptAuditText(prompt: LivePromptAudit, view: PromptAuditView): string | undefined {
@@ -422,8 +555,8 @@ function foregroundActiveDetail(item: Extract<FleetItem, { kind: "foreground-act
 	const { control } = item;
 	const live = item.activeChild ?? control;
 	const modelThinking = formatModelThinking(live.model, live.thinking);
-	const promptAuditCount = foregroundPromptAuditCount(item, state);
-	const promptSummary = foregroundAuthoredPromptSummary(item, state);
+	const promptAuditCount = promptAuditEntriesForScope(promptAuditScopeForItem(item), state).length;
+	const promptSummary = rowPromptSummary(item, state);
 	const lines = [
 		`Run: ${item.runId}`,
 		"Source: foreground",
@@ -442,7 +575,7 @@ function foregroundActiveDetail(item: Extract<FleetItem, { kind: "foreground-act
 		live.tokens !== undefined
 			? `Tokens: ${formatTokenUsage({ input: live.inputTokens ?? 0, output: live.outputTokens ?? 0, total: live.tokens, ...(live.window !== undefined ? { window: live.window } : {}), ...(live.windowPeak !== undefined ? { windowPeak: live.windowPeak } : {}) }, "tokens")}`
 			: undefined,
-		promptAuditCount > 0 ? `Prompt audit: ${promptAuditCount} live · 3 views · p opens` : undefined,
+		promptAuditDetailLine(item, promptAuditCount),
 		"",
 		"Transcript",
 		"Live foreground output remains in the expanded subagent tool result. Persisted output and session paths appear here after the child settles.",
@@ -577,8 +710,15 @@ function workflowProgressLines(steps: AsyncJobStep[] | undefined): string[] {
 	return lines;
 }
 
+function asyncPromptAuditLines(item: Extract<FleetItem, { kind: "async" }>, state: SubagentState): string[] {
+	const promptSummary = rowPromptSummary(item, state);
+	const detailLine = promptAuditDetailLine(item, promptAuditEntriesForScope(promptAuditScopeForItem(item), state, [item]).length);
+	return [promptSummary ? `Task: ${promptSummary}` : undefined, detailLine].filter((line): line is string => line !== undefined);
+}
+
 function asyncDetail(item: Extract<FleetItem, { kind: "async" }>, state: SubagentState): string[] {
 	const status = readStatus(item.run.asyncDir);
+	const promptLines = asyncPromptAuditLines(item, state);
 	if (status) {
 		const trackedJob = state.fleetJobs?.get(item.runId) ?? state.asyncJobs.get(item.runId);
 		const lines = formatAsyncRunTranscript(status, item.run.asyncDir, {
@@ -595,6 +735,10 @@ function asyncDetail(item: Extract<FleetItem, { kind: "async" }>, state: Subagen
 				lines.splice(modeIndex >= 0 ? modeIndex + 1 : 0, 0, "", ...progress);
 			}
 		}
+		if (promptLines.length) {
+			const modeIndex = lines.findIndex((line) => line.startsWith("Mode:"));
+			lines.splice(modeIndex >= 0 ? modeIndex + 1 : 0, 0, ...promptLines);
+		}
 		return lines;
 	}
 	const outputPath = item.index !== undefined ? path.join(item.run.asyncDir, `output-${item.index}.log`) : undefined;
@@ -606,6 +750,7 @@ function asyncDetail(item: Extract<FleetItem, { kind: "async" }>, state: Subagen
 		item.index !== undefined ? `Child: ${item.index} (${item.agent})${contextModeLabel(item.step?.context) ? ` ${contextModeLabel(item.step?.context)}` : ""}` : `Agent: ${item.agent}${contextModeLabel(item.run.context) ? ` ${contextModeLabel(item.run.context)}` : ""}`,
 		outputPath ? `Output: ${outputPath}` : undefined,
 		item.step?.sessionFile ? `Session: ${item.step.sessionFile}` : item.run.sessionFile ? `Session: ${item.run.sessionFile}` : undefined,
+		...promptLines,
 		"",
 		"Transcript",
 		"(status is no longer available)",
@@ -825,6 +970,8 @@ export class SubagentFleetComponent implements Component, Focusable {
 	private renderedLayout: FleetLayout | undefined;
 	private expandedTools = false;
 	private promptAuditOpen = false;
+	private promptAuditScope: PromptAuditScope | undefined;
+	private promptAuditKey: string | undefined;
 	private promptAuditView: PromptAuditView = "authored";
 	private actionNotice: FleetActionResult | undefined;
 	private steerDraft: string | undefined;
@@ -916,37 +1063,35 @@ export class SubagentFleetComponent implements Component, Focusable {
 		this.tui.requestRender();
 	}
 
-	private selectedPromptAudit(): LivePromptAudit | undefined {
-		const item = this.snapshot.items[this.selected];
-		if (item?.kind !== "foreground-active") return undefined;
-		if (!this.state.currentSessionId || item.control.sessionId !== this.state.currentSessionId) return undefined;
-		return getLivePromptAudit(item.control, item.index ?? 0);
+	private promptAuditEntries(): PromptAuditEntry[] {
+		const scope = this.promptAuditOpen ? this.promptAuditScope : promptAuditScopeForItem(this.snapshot.items[this.selected]);
+		return promptAuditEntriesForScope(scope, this.state, this.snapshot.items);
 	}
 
-	private promptAuditItems(): Array<{ item: Extract<FleetItem, { kind: "foreground-active" }>; prompt: LivePromptAudit }> {
+	private selectedPromptAuditEntry(): PromptAuditEntry | undefined {
+		const entries = this.promptAuditEntries();
+		if (this.promptAuditOpen) return entries.find((entry) => entry.key === this.promptAuditKey);
 		const selected = this.snapshot.items[this.selected];
-		if (selected?.kind !== "foreground-active" || !this.state.currentSessionId || selected.control.sessionId !== this.state.currentSessionId) return [];
-		return this.snapshot.items.flatMap((item) => {
-			if (item.kind !== "foreground-active" || item.control !== selected.control) return [];
-			const prompt = getLivePromptAudit(item.control, item.index ?? 0);
-			return prompt ? [{ item, prompt }] : [];
-		});
+		return selected ? promptAuditEntryForItem(selected, entries) : undefined;
 	}
 
 	private selectedPromptText(): string | undefined {
-		const prompt = this.selectedPromptAudit();
-		return prompt ? promptAuditText(prompt, this.promptAuditView) : undefined;
+		const entry = this.selectedPromptAuditEntry();
+		return entry ? promptAuditText(entry.prompt, this.promptAuditView) : undefined;
 	}
 
 	private movePromptSelection(delta: number): void {
-		const items = this.promptAuditItems();
-		if (items.length === 0) return;
-		const currentKey = this.snapshot.items[this.selected]?.key;
-		const current = Math.max(0, items.findIndex(({ item }) => item.key === currentKey));
-		const target = items[Math.max(0, Math.min(items.length - 1, current + delta))]?.item;
+		const entries = this.promptAuditEntries();
+		if (entries.length === 0) return;
+		const current = Math.max(0, entries.findIndex((entry) => entry.key === this.promptAuditKey));
+		const target = entries[Math.max(0, Math.min(entries.length - 1, current + delta))];
 		if (!target) return;
-		this.selected = this.snapshot.items.findIndex((item) => item.key === target.key);
-		this.selectedKey = target.key;
+		this.promptAuditKey = target.key;
+		const fleetIndex = this.snapshot.items.findIndex((item) => item.key === target.fleetKey);
+		if (fleetIndex >= 0) {
+			this.selected = fleetIndex;
+			this.selectedKey = target.fleetKey;
+		}
 		this.viewport.resetTop();
 		this.tui.requestRender();
 	}
@@ -1018,8 +1163,8 @@ export class SubagentFleetComponent implements Component, Focusable {
 		return lines;
 	}
 
-	private withActionLines(body: string[]): string[] {
-		const actionLines = this.actionLines();
+	private withActionLines(body: string[], width: number): string[] {
+		const actionLines = this.actionLines().flatMap((line) => wrapTextWithAnsi(line, Math.max(1, width)));
 		return actionLines.length ? [...actionLines, "", ...body] : body;
 	}
 
@@ -1099,12 +1244,13 @@ export class SubagentFleetComponent implements Component, Focusable {
 					this.setActionNotice({ text: "Redo guidance cannot be empty.", isError: true });
 					return;
 				}
-				const selected = this.snapshot.items[this.selected];
-				if (selected?.kind !== "foreground-active" || !this.options.actions?.redoPrompt) {
+				const entry = this.selectedPromptAuditEntry();
+				if (!entry?.control || !this.options.actions?.redoPrompt) {
 					this.setActionNotice({ text: "Redo is unavailable for this prompt.", isError: true });
 					return;
 				}
-				this.runAction(() => this.options.actions!.redoPrompt!({ runId: selected.runId, index: selected.index ?? 0, guidance, control: selected.control }));
+				const control = entry.control;
+				this.runAction(() => this.options.actions!.redoPrompt!({ runId: entry.runId, index: entry.index, guidance, control }));
 				return;
 			}
 			if (matchesKey(data, "backspace") || data === "\x7f") {
@@ -1121,6 +1267,8 @@ export class SubagentFleetComponent implements Component, Focusable {
 		if (this.promptAuditOpen) {
 			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 				this.promptAuditOpen = false;
+				this.promptAuditScope = undefined;
+				this.promptAuditKey = undefined;
 				this.viewport.follow();
 				this.tui.requestRender();
 				return;
@@ -1134,9 +1282,10 @@ export class SubagentFleetComponent implements Component, Focusable {
 				return;
 			}
 			if (data === "g") {
-				const prompt = this.selectedPromptAudit();
-				if (!prompt) this.setActionNotice({ text: "Prompt Audit is available only for a live child owned by this session.", isError: true });
-				else if (!prompt.rerun) this.setActionNotice({ text: "Redo is not safe for this prompt in this slice.", isError: true });
+				const entry = this.selectedPromptAuditEntry();
+				if (!entry) this.setActionNotice({ text: "The selected prompt is no longer recorded; press j/k to pick another child or Esc to close.", isError: true });
+				else if (entry.source === "async") this.setActionNotice({ text: "Redo is not available for async runs yet; press c to copy the prompt and relaunch it manually.", isError: true });
+				else if (!entry.prompt.rerun || !entry.control) this.setActionNotice({ text: "Redo is not safe for this prompt in this slice.", isError: true });
 				else if (!this.options.actions?.redoPrompt) this.setActionNotice({ text: "Redo controls are unavailable in this context.", isError: true });
 				else {
 					this.actionNotice = undefined;
@@ -1235,9 +1384,14 @@ export class SubagentFleetComponent implements Component, Focusable {
 			return;
 		}
 		if (data === "p") {
-			if (!this.selectedPromptAudit()) this.setActionNotice({ text: "Prompt Audit is available only for a live child owned by this session.", isError: true });
+			const selected = this.snapshot.items[this.selected];
+			const scope = promptAuditScopeForItem(selected);
+			const entry = selected ? promptAuditEntryForItem(selected, promptAuditEntriesForScope(scope, this.state, this.snapshot.items)) : undefined;
+			if (!entry) this.setActionNotice({ text: promptAuditUnavailableReason(selected, this.state), isError: true });
 			else {
 				this.promptAuditOpen = true;
+				this.promptAuditScope = scope;
+				this.promptAuditKey = entry.key;
 				this.promptAuditView = "authored";
 				this.viewport.resetTop();
 				this.actionNotice = undefined;
@@ -1321,30 +1475,31 @@ export class SubagentFleetComponent implements Component, Focusable {
 	}
 
 	private promptAuditDetail(width: number): FleetDetailSections {
-		const selected = this.snapshot.items[this.selected];
-		const prompt = this.selectedPromptAudit();
-		const items = this.promptAuditItems();
-		const selectedPosition = selected ? items.findIndex(({ item }) => item.key === selected.key) : -1;
-		const live = selected?.kind === "foreground-active" ? selected.activeChild ?? selected.control : undefined;
+		const entry = this.selectedPromptAuditEntry();
+		const entries = this.promptAuditEntries();
+		const selectedPosition = entry ? entries.findIndex((candidate) => candidate.key === entry.key) : -1;
+		const prompt = entry?.prompt;
 		const viewLabel = promptAuditViewLabel(this.promptAuditView);
 		const promptText = this.selectedPromptText()
 			?? this.theme.fg("muted", "Selected prompt unavailable.");
+		const asyncSource = entry?.source === "async" || this.promptAuditScope?.kind === "async";
 		const raw = [
 			this.theme.bold("Prompt Audit"),
 			this.theme.fg("dim", "Retention: live memory only · no storage"),
-			selected?.kind === "foreground-active" ? `Run: ${selected.runId}${selected.index !== undefined ? ` · Child: ${selected.index}` : ""} · Agent: ${selected.agent}` : "Selected prompt unavailable",
-			live ? `Started: ${new Date(live.startedAt).toISOString()}` : undefined,
-			live ? `Model: ${formatModelThinking(live.model, live.thinking) || "default"}` : undefined,
+			entry ? `Run: ${entry.runId} · Child: ${entry.index} · Agent: ${entry.agent}` : "Selected prompt unavailable",
+			entry ? `Source: ${entry.source === "async" ? "async · background runner" : "foreground"}` : undefined,
+			entry?.startedAt !== undefined ? `Started: ${new Date(entry.startedAt).toISOString()}` : undefined,
+			entry ? `Model: ${formatModelThinking(entry.model, entry.thinking) || "default"}` : undefined,
 			prompt?.cwd ? `Cwd: ${prompt.cwd}` : undefined,
 			prompt?.outputPath ? `Output: ${prompt.outputPath}` : undefined,
-			this.theme.fg("dim", `Live children: ${items.map(({ item }) => item.agent).join(", ") || "none"}`),
-			this.theme.fg("dim", selectedPosition >= 0 ? `Selected: ${selectedPosition + 1}/${items.length}` : "Selected prompt unavailable"),
+			this.theme.fg("dim", `${asyncSource ? "Recorded" : "Live"} children: ${entries.map((candidate) => candidate.agent).join(", ") || "none"}`),
+			this.theme.fg("dim", selectedPosition >= 0 ? `Selected: ${selectedPosition + 1}/${entries.length}` : "Selected prompt unavailable"),
 			"",
 			this.theme.fg("accent", viewLabel),
 			promptText,
 		];
 		const body = raw.filter((line): line is string => line !== undefined).flatMap((line) => wrapTextWithAnsi(line, Math.max(1, width)));
-		return { header: [], body: this.withActionLines(body) };
+		return { header: [], body: this.withActionLines(body, width) };
 	}
 
 	private wrappedDetail(width: number): FleetDetailSections {
@@ -1366,8 +1521,8 @@ export class SubagentFleetComponent implements Component, Focusable {
 							: latest?.kind === "tool"
 								? `${latest.name} · ${latest.status}`
 								: "activity";
-					const promptSummary = selected.kind === "foreground-active" ? foregroundAuthoredPromptSummary(selected, this.state) : undefined;
-					return { header: structuredHeader(selected, width, this.theme, conversationState, promptSummary), body: this.withActionLines(body) };
+					const promptSummary = rowPromptSummary(selected, this.state);
+					return { header: structuredHeader(selected, width, this.theme, conversationState, promptSummary), body: this.withActionLines(body, width) };
 				}
 			}
 		}
@@ -1388,7 +1543,7 @@ export class SubagentFleetComponent implements Component, Focusable {
 			const wrapped = wrapTextWithAnsi(styled, Math.max(1, width));
 			lines.push(...(wrapped.length ? wrapped : [""]));
 		}
-		return { header: [], body: this.withActionLines(lines) };
+		return { header: [], body: this.withActionLines(lines, width) };
 	}
 
 	render(width: number): string[] {

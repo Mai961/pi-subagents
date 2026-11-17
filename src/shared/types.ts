@@ -8,6 +8,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ModelScopeRule } from "../runs/shared/model-scope.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import type { AuthorityPolicyConfig } from "../policy/authority.ts";
+import type { AsyncPromptAuditStore } from "../runs/foreground/prompt-audit.ts";
 import type { ThinkingLevel } from "./model-info.ts";
 import type { SubagentFeature } from "./disabled-features.ts";
 import type { GlobalMissionIndexRecord, MissionRecord, MissionStoreConfig } from "../missions/types.ts";
@@ -2387,6 +2388,8 @@ export interface ActiveAsyncCapacitySnapshot {
 }
 
 export interface SubagentState {
+	/** Async Prompt Audit records (memory only). The extension binds the process-wide store so records survive /reload. */
+	asyncPromptAudits?: AsyncPromptAuditStore;
 	baseCwd: string;
 	currentSessionId: string | null;
 	/** Exact SDK runtime session ID (`getSessionId()`) for supervisor ownership and background-work matching; never a session file path. */

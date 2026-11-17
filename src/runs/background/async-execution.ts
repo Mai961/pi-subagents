@@ -37,7 +37,8 @@ import { buildWorktreeNaming, resolveExpectedWorktreeAgentCwd, resolveWorktreePr
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime } from "../shared/structured-output.ts";
-import { resolveAcceptanceReportMode, resolveEffectiveAcceptance, validateAcceptanceInput, validateExecutionAcceptance } from "../shared/acceptance.ts";
+import { formatAcceptancePrompt, resolveAcceptanceReportMode, resolveEffectiveAcceptance, validateAcceptanceInput, validateExecutionAcceptance } from "../shared/acceptance.ts";
+import { isAgentContract } from "../shared/agent-contract.ts";
 import { createRunFanoutBudget, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import {
 	type AcceptanceInput,
@@ -283,6 +284,11 @@ interface AsyncSingleParams {
 	agentConfig: AgentConfig;
 	/** Agent contract before per-run bridge injection, used only for recovery persistence. */
 	recoveryAgentConfig?: AgentConfig;
+	/**
+	 * Receives the prompt the background runner will send, after a successful spawn.
+	 * Parent-memory Prompt Audit only; callers must never persist it.
+	 */
+	onEffectivePrompt?: (audit: { effectivePrompt: string; cwd: string; outputPath?: string }) => void;
 	requiredExtensions?: RequiredChildExtensionSnapshot;
 	ctx: AsyncExecutionContext;
 	cwd?: string;
@@ -2411,6 +2417,21 @@ export function executeAsyncSingle(
 	if (!spawnResult.pid || !spawnResult.runnerProcessInstanceId) {
 		params.activeAsyncCapacity?.rollback();
 		return formatAsyncStartError("single", `Failed to start async run '${id}': runner identity unavailable`);
+	}
+	if (params.onEffectivePrompt) {
+		// Mirror the runner's single-step prompt assembly (placeholder + acceptance contract) so the
+		// parent can audit it from memory without the runner shipping prompt text back.
+		const acceptancePrompt = formatAcceptancePrompt(resolvedAcceptance, { reportOptional: isAgentContract(params.agentContract), structuredOutput: Boolean(structuredOutput?.acceptanceReportPath) });
+		const runnerTask = taskText.replace(/\{previous\}/g, () => "");
+		try {
+			params.onEffectivePrompt({
+				effectivePrompt: acceptancePrompt ? `${runnerTask}\n${acceptancePrompt}` : runnerTask,
+				cwd: instructionCwd,
+				...(outputPath ? { outputPath } : {}),
+			});
+		} catch (error) {
+			console.warn(`[pi-subagents] Prompt Audit registration failed for ${id}: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 	if (spawnResult.pid) {
 		if (inheritedNestedRoute && nestedAddress) {
