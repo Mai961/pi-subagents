@@ -1086,7 +1086,9 @@ function reportEvidenceStatus(report: AcceptanceReport, kind: AcceptanceEvidence
 		case "tests-added":
 			if (!isStringArray(report.testsAddedOrUpdated)) return "failed";
 			return report.testsAddedOrUpdated.length === 0 ? "not-applicable" : "passed";
-		case "commands-run": return Array.isArray(report.commandsRun) && report.commandsRun.length > 0 ? "passed" : "failed";
+		case "commands-run":
+			if (!Array.isArray(report.commandsRun)) return "failed";
+			return report.commandsRun.length === 0 ? "not-applicable" : "passed";
 		case "validation-output": return isStringArray(report.validationOutput) && report.validationOutput.length > 0 ? "passed" : "failed";
 		case "residual-risks": return isStringArray(report.residualRisks) ? "passed" : "failed";
 		case "no-staged-files": return report.noStagedFiles === true ? "passed" : "failed";
