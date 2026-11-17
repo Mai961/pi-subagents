@@ -187,7 +187,36 @@ export interface AsyncPromptAuditRecord {
 	prompts: Map<number, LivePromptAudit & { agent?: string }>;
 }
 
-const asyncPrompts = new WeakMap<SubagentState, Map<string, AsyncPromptAuditRecord>>();
+export type AsyncPromptAuditStore = Map<string, AsyncPromptAuditRecord>;
+
+const PROCESS_STORE_KEY = Symbol.for("pi-subagents.async-prompt-audit-store.v1");
+
+/**
+ * Process-wide async Prompt Audit store. A state bound to it (the extension's) keeps records across
+ * /reload and session switches inside one Pi process: the reloaded extension instance finds the same
+ * Map on globalThis. Records stay session-scoped by their sessionId and are never written to disk;
+ * they end with the process.
+ */
+export function processAsyncPromptAuditStore(): AsyncPromptAuditStore {
+	const holder = globalThis as typeof globalThis & { [PROCESS_STORE_KEY]?: AsyncPromptAuditStore };
+	holder[PROCESS_STORE_KEY] ??= new Map();
+	return holder[PROCESS_STORE_KEY];
+}
+
+/** Fallback for states not bound to a store (tests, embedders): records live and die with the state. */
+const unboundAsyncPrompts = new WeakMap<SubagentState, AsyncPromptAuditStore>();
+
+function asyncPromptRuns(state: SubagentState, create: true): AsyncPromptAuditStore;
+function asyncPromptRuns(state: SubagentState, create?: false): AsyncPromptAuditStore | undefined;
+function asyncPromptRuns(state: SubagentState, create = false): AsyncPromptAuditStore | undefined {
+	if (state.asyncPromptAudits) return state.asyncPromptAudits;
+	let runs = unboundAsyncPrompts.get(state);
+	if (!runs && create) {
+		runs = new Map();
+		unboundAsyncPrompts.set(state, runs);
+	}
+	return runs;
+}
 
 export function registerAsyncPromptAudit(state: SubagentState, input: {
 	runId: string;
@@ -201,11 +230,7 @@ export function registerAsyncPromptAudit(state: SubagentState, input: {
 	outputPath?: string;
 	parentWorkflowRunId?: string;
 }): void {
-	let runs = asyncPrompts.get(state);
-	if (!runs) {
-		runs = new Map();
-		asyncPrompts.set(state, runs);
-	}
+	const runs = asyncPromptRuns(state, true);
 	let record = runs.get(input.runId);
 	if (!record || record.sessionId !== input.sessionId) {
 		record = {
@@ -235,27 +260,28 @@ export function registerAsyncPromptAudit(state: SubagentState, input: {
 /** Returns the recorded run only when it was launched by `sessionId`. */
 export function getAsyncPromptAuditRun(state: SubagentState, runId: string, sessionId: string | null | undefined): AsyncPromptAuditRecord | undefined {
 	if (!sessionId) return undefined;
-	const record = asyncPrompts.get(state)?.get(runId);
+	const record = asyncPromptRuns(state)?.get(runId);
 	return record?.sessionId === sessionId ? record : undefined;
 }
 
 export function asyncPromptAuditOwner(state: SubagentState, runId: string): string | undefined {
-	return asyncPrompts.get(state)?.get(runId)?.sessionId;
+	return asyncPromptRuns(state)?.get(runId)?.sessionId;
 }
 
 export function listAsyncPromptAuditRuns(state: SubagentState, sessionId: string | null | undefined): Array<[string, AsyncPromptAuditRecord]> {
 	if (!sessionId) return [];
-	return [...(asyncPrompts.get(state)?.entries() ?? [])].filter(([, record]) => record.sessionId === sessionId);
+	return [...(asyncPromptRuns(state)?.entries() ?? [])].filter(([, record]) => record.sessionId === sessionId);
 }
 
 export function removeAsyncPromptAudit(state: SubagentState, runId: string): void {
-	asyncPrompts.get(state)?.delete(runId);
+	asyncPromptRuns(state)?.delete(runId);
 }
 
+/** Drops every record visible to `state`; for a process-bound state this clears the shared store. */
 export function clearAsyncPromptAudits(state: SubagentState): void {
-	asyncPrompts.delete(state);
+	asyncPromptRuns(state)?.clear();
 }
 
 export function asyncPromptAuditRunCount(state: SubagentState): number {
-	return asyncPrompts.get(state)?.size ?? 0;
+	return asyncPromptRuns(state)?.size ?? 0;
 }

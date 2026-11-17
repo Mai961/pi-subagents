@@ -35,7 +35,7 @@ import { withCachedUiContext } from "../../shared/extension-context.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 import { ownerSessionIds } from "../shared/run-ownership.ts";
-import { clearAsyncPromptAudits, removeAsyncPromptAudit } from "../foreground/prompt-audit.ts";
+import { removeAsyncPromptAudit } from "../foreground/prompt-audit.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -863,7 +863,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		state.cleanupTimers.clear();
 		state.asyncJobs.clear();
 		state.fleetJobs?.clear();
-		clearAsyncPromptAudits(state);
+		// Async Prompt Audit records survive session resets; lookups are scoped by session id.
 		state.foregroundControls?.clear();
 		state.liveAsyncSessionRoots?.clear();
 		state.lastForegroundControlId = null;

@@ -489,7 +489,11 @@ function promptAuditEntriesForScope(scope: PromptAuditScope | undefined, state: 
 }
 
 function promptAuditEntryForItem(item: FleetItem, entries: PromptAuditEntry[]): PromptAuditEntry | undefined {
-	return entries.find((entry) => entry.fleetKey === item.key) ?? entries[0];
+	const exact = entries.find((entry) => entry.fleetKey === item.key);
+	// A foreground child row is one child: never open a sibling's prompt for a row without its own record.
+	// Run-level async and workflow rows stand for their children, so they open the first one.
+	if (exact || item.kind === "foreground-active") return exact;
+	return entries[0];
 }
 
 function promptAuditDetailLine(item: FleetItem, count: number): string | undefined {

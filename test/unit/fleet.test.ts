@@ -17,7 +17,7 @@ import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { spawnSync } from "node:child_process";
 import { FLEET_STATUS_WIDGET_KEY } from "../../src/tui/fleet-status.ts";
 import { setMainThinkingLevelSource } from "../../src/tui/running-tone.ts";
-import { asyncPromptAuditRunCount, clearAsyncPromptAudits, getAsyncPromptAuditRun, MAX_ASYNC_PROMPT_AUDIT_RUNS, registerAsyncPromptAudit, registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
+import { asyncPromptAuditRunCount, clearAsyncPromptAudits, getAsyncPromptAuditRun, MAX_ASYNC_PROMPT_AUDIT_RUNS, processAsyncPromptAuditStore, registerAsyncPromptAudit, registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
 import { getArtifactPaths, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
 import type { HerdrClient } from "../../src/inspectors/herdr/client.ts";
 import { createHerdrInspectorPlugin } from "../../src/inspectors/herdr/plugin.ts";
@@ -488,6 +488,40 @@ describe("native subagent fleet", () => {
 		}
 	});
 
+	it("never opens a sibling's prompt for a foreground child row without its own record", () => {
+		const state = stateForTest();
+		const control = {
+			runId: "fg-siblings",
+			sessionId: state.currentSessionId!,
+			mode: "single" as const,
+			startedAt: 10,
+			updatedAt: 20,
+			activeChildren: new Map([
+				[0, { index: 0, agent: "worker", startedAt: 10, updatedAt: 30 }],
+				[1, { index: 1, agent: "reviewer", startedAt: 10, updatedAt: 20 }],
+			]),
+		};
+		state.foregroundControls.set(control.runId, control);
+		registerLivePromptAudit(control, 1, "SIBLING_ONLY_PROMPT", "SIBLING_ONLY_PROMPT");
+		const component = new SubagentFleetComponent(
+			{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+			theme as never,
+			state,
+			() => {},
+			{ refreshMs: 60_000, markdownTheme },
+		);
+		try {
+			// Child 0 is selected first and has no record of its own.
+			assert.match(component.render(100).join("\n"), /Child: 0 \(worker\)/);
+			component.handleInput("p");
+			const rendered = component.render(100).join("\n");
+			assert.match(rendered, /Prompt Audit is available only/);
+			assert.doesNotMatch(rendered, /SIBLING_ONLY_PROMPT/);
+		} finally {
+			component.dispose();
+		}
+	});
+
 	it("opens Prompt Audit for current-session async single and parallel runs from parent memory", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-async-audit-"));
 		const single = "ASYNC_SINGLE_AUDIT_SENTINEL";
@@ -669,6 +703,20 @@ describe("native subagent fleet", () => {
 		assert.ok(getAsyncPromptAuditRun(state, `cap-${MAX_ASYNC_PROMPT_AUDIT_RUNS + 4}`, "session-current"));
 		clearAsyncPromptAudits(state);
 		assert.equal(asyncPromptAuditRunCount(state), 0);
+	});
+
+	it("shares async Prompt Audit records between states bound to the process store, as across /reload", () => {
+		const runId = `process-store-${Date.now()}`;
+		const before = { ...stateForTest(), asyncPromptAudits: processAsyncPromptAuditStore() };
+		const after = { ...stateForTest(), asyncPromptAudits: processAsyncPromptAuditStore() };
+		try {
+			registerAsyncPromptAudit(before, { runId, index: 0, sessionId: "session-current", authoredTask: "survives reload" });
+			assert.equal(getAsyncPromptAuditRun(after, runId, "session-current")?.prompts.get(0)?.authoredTask, "survives reload");
+			assert.equal(getAsyncPromptAuditRun(after, runId, "session-other"), undefined);
+			assert.equal(getAsyncPromptAuditRun(stateForTest(), runId, "session-current"), undefined, "unbound states keep their own records");
+		} finally {
+			processAsyncPromptAuditStore().delete(runId);
+		}
 	});
 
 	it("keeps tracked missing-start rows stable across opposing heartbeat updates", () => {

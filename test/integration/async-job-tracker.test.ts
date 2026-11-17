@@ -479,7 +479,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("drops async Prompt Audit records when fleet history prunes a run or the session resets", () => {
+	it("drops async Prompt Audit records when fleet history prunes a run, but keeps them across a session reset", () => {
 		const asyncRoot = createTempDir("pi-async-job-audit-prune-");
 		try {
 			const state = createState();
@@ -497,8 +497,9 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				assert.equal(Boolean(getAsyncPromptAuditRun(state as never, id, "session-current")), state.fleetJobs.has(id), `audit retention for ${id} should follow fleet history`);
 			}
 			assert.equal(asyncPromptAuditRunCount(state as never), state.fleetJobs.size);
+			const retained = asyncPromptAuditRunCount(state as never);
 			tracker.resetJobs();
-			assert.equal(asyncPromptAuditRunCount(state as never), 0, "session reset should clear async prompt audits");
+			assert.equal(asyncPromptAuditRunCount(state as never), retained, "a session reset keeps async prompt audits; lookups are session-scoped");
 		} finally {
 			removeTempDir(asyncRoot);
 		}
